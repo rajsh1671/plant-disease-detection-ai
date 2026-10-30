@@ -1,14 +1,20 @@
 
 import os
 
-# Force TensorFlow to use CPU on Render
+# ==========================================
+# 1. TENSORFLOW CPU CONFIGURATION
+# Must be set before importing TensorFlow
+# ==========================================
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_XLA_FLAGS"] = "--tf_xla_auto_jit=0"
 
 import json
 import csv
 import logging
 import tempfile
+import time
 from datetime import datetime
 
 import numpy as np
@@ -17,7 +23,7 @@ import tensorflow as tf
 from PIL import Image
 
 # ==========================================
-# 1. PROJECT CONFIGURATION
+# 2. PROJECT CONFIGURATION
 # ==========================================
 
 logging.basicConfig(level=logging.INFO)
@@ -34,26 +40,42 @@ LABELS_PATH = os.path.join(
 )
 
 EXAMPLES_DIR = os.path.join(BASE_DIR, "examples")
+
 IMG_SIZE = 160
 NUM_CLASSES = 38
 
+# Disable automatic XLA/JIT compilation.
+tf.config.optimizer.set_jit(False)
+
+# Limit CPU threads for the Render free instance.
+try:
+    tf.config.threading.set_intra_op_parallelism_threads(2)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+except RuntimeError:
+    logger.warning("TensorFlow threading was already initialized.")
+
 # ==========================================
-# 2. LOAD TRAINED MODEL AND CLASS LABELS
+# 3. LOAD TRAINED MODEL AND CLASS LABELS
 # ==========================================
 
 if not os.path.exists(MODEL_PATH):
     raise FileNotFoundError(
-        f"Model not found: {MODEL_PATH}"
+        f"Model file not found: {MODEL_PATH}"
     )
 
 if not os.path.exists(LABELS_PATH):
     raise FileNotFoundError(
-        f"Class labels not found: {LABELS_PATH}"
+        f"Class labels file not found: {LABELS_PATH}"
     )
 
 logger.info("Loading Plant Disease Detection model...")
 
-model = tf.keras.models.load_model(MODEL_PATH)
+load_start = time.perf_counter()
+
+model = tf.keras.models.load_model(
+    MODEL_PATH,
+    compile=False
+)
 
 with open(LABELS_PATH, "r", encoding="utf-8") as file:
     class_names = json.load(file)
@@ -65,16 +87,20 @@ if not isinstance(class_names, list) or len(class_names) != NUM_CLASSES:
 
 if model.output_shape[-1] != len(class_names):
     raise ValueError(
-        "Model output count does not match the class labels."
+        "Model output count does not match class labels."
     )
 
-logger.info("Model loaded successfully.")
+logger.info(
+    "Model loaded successfully in %.2f seconds.",
+    time.perf_counter() - load_start
+)
 
 # ==========================================
-# 3. PREDICTION AND REPORT GENERATION
+# 4. PREDICT PLANT DISEASE
 # ==========================================
 
 def predict_disease(image):
+
     if image is None:
         return (
             {},
@@ -82,21 +108,49 @@ def predict_disease(image):
             "Please upload a plant leaf image first."
         )
 
+    report_path = None
+
     try:
-        # Prepare the image
+        logger.info("Prediction request received.")
+
+        prediction_start = time.perf_counter()
+
+        # Convert and resize the uploaded image.
         image = image.convert("RGB")
         image = image.resize((IMG_SIZE, IMG_SIZE))
 
-        image_array = np.array(image, dtype=np.float32)
-        image_array = np.expand_dims(image_array, axis=0)
+        image_array = np.asarray(
+            image,
+            dtype=np.float32
+        )
 
-        # Predict using the existing trained model
-        predictions = model.predict(
-            image_array, verbose=0
-        )[0]
+        image_array = np.expand_dims(
+            image_array,
+            axis=0
+        )
 
-        # Select the five highest-scoring classes
-        top_indices = np.argsort(predictions)[-5:][::-1]
+        logger.info("Image preprocessing completed.")
+
+        # Direct eager inference instead of model.predict().
+        # This avoids the extra Keras predict data pipeline.
+        inference_start = time.perf_counter()
+
+        prediction_tensor = model(
+            image_array,
+            training=False
+        )
+
+        predictions = prediction_tensor.numpy()[0]
+
+        logger.info(
+            "Inference completed in %.2f seconds.",
+            time.perf_counter() - inference_start
+        )
+
+        # Select the five highest-scoring categories.
+        top_indices = np.argsort(
+            predictions
+        )[-5:][::-1]
 
         results = {}
 
@@ -104,10 +158,13 @@ def predict_disease(image):
             label = class_names[int(index)]
             confidence = float(predictions[index])
 
-            results[label.replace("___", " - ")] = confidence
+            results[
+                label.replace("___", " - ")
+            ] = confidence
 
-        # Create a downloadable CSV report
-        report_path = None
+        # ==================================
+        # GENERATE DOWNLOADABLE CSV REPORT
+        # ==================================
 
         with tempfile.NamedTemporaryFile(
             mode="w",
@@ -119,6 +176,7 @@ def predict_disease(image):
         ) as report_file:
 
             report_path = report_file.name
+
             writer = csv.writer(report_file)
 
             writer.writerow([
@@ -127,7 +185,9 @@ def predict_disease(image):
 
             writer.writerow([
                 "Analysis Date",
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
             ])
 
             writer.writerow([
@@ -141,17 +201,25 @@ def predict_disease(image):
             ])
 
             writer.writerow([])
+
             writer.writerow([
                 "Rank",
                 "Predicted Class",
                 "Model Score (%)"
             ])
 
-            for rank, index in enumerate(top_indices, start=1):
-                label = class_names[int(index)].replace(
-                    "___", " - "
-                )
-                score = float(predictions[index]) * 100
+            for rank, index in enumerate(
+                top_indices,
+                start=1
+            ):
+
+                label = class_names[
+                    int(index)
+                ].replace("___", " - ")
+
+                score = float(
+                    predictions[index]
+                ) * 100
 
                 writer.writerow([
                     rank,
@@ -159,23 +227,44 @@ def predict_disease(image):
                     f"{score:.2f}"
                 ])
 
+        # Main prediction.
         top_label = class_names[
             int(top_indices[0])
         ].replace("___", " - ")
 
-        top_score = float(predictions[top_indices[0]]) * 100
+        top_score = float(
+            predictions[top_indices[0]]
+        ) * 100
+
+        total_time = (
+            time.perf_counter() - prediction_start
+        )
 
         status = (
             "### Analysis complete\n"
             f"**Top prediction:** {top_label}\n\n"
             f"**Model score:** {top_score:.2f}%\n\n"
+            f"**Processing time:** {total_time:.2f} seconds\n\n"
             "Download the CSV report for all five predictions."
+        )
+
+        logger.info(
+            "Prediction completed successfully in %.2f seconds.",
+            total_time
         )
 
         return results, report_path, status
 
     except Exception as error:
-        logger.exception("Prediction failed")
+
+        logger.exception("Prediction failed.")
+
+        # Remove an incomplete report if one was created.
+        if report_path and os.path.exists(report_path):
+            try:
+                os.remove(report_path)
+            except OSError:
+                pass
 
         raise gr.Error(
             f"Image analysis failed: {str(error)}"
@@ -183,10 +272,11 @@ def predict_disease(image):
 
 
 # ==========================================
-# 4. RESET FUNCTION
+# 5. RESET FUNCTION
 # ==========================================
 
 def reset_app():
+
     return (
         None,
         {},
@@ -196,7 +286,7 @@ def reset_app():
 
 
 # ==========================================
-# 5. FOREST-GREEN WEB INTERFACE
+# 6. FOREST-GREEN WEBSITE DESIGN
 # ==========================================
 
 custom_css = """
@@ -238,9 +328,11 @@ theme = gr.themes.Soft(
     neutral_hue="slate"
 )
 
+# ==========================================
+# 7. CREATE GRADIO INTERFACE
+# ==========================================
+
 with gr.Blocks(
-    theme=theme,
-    css=custom_css,
     title="PlantGuard AI - Plant Disease Detection"
 ) as demo:
 
@@ -257,6 +349,7 @@ with gr.Blocks(
     gr.Markdown("## About This Project")
 
     with gr.Row():
+
         with gr.Column():
             gr.Markdown("""
             <div class="info-card">
@@ -286,6 +379,7 @@ with gr.Blocks(
 
     gr.Markdown("""
     ### How to use
+
     1. Upload a clear image of a plant leaf.
     2. Click **Analyze Leaf**.
     3. Review the five highest-scoring predictions.
@@ -294,7 +388,9 @@ with gr.Blocks(
 
     # Main application
     with gr.Row():
+
         with gr.Column(scale=1):
+
             image_input = gr.Image(
                 type="pil",
                 label="📷 Upload Plant Leaf",
@@ -302,6 +398,7 @@ with gr.Blocks(
             )
 
             with gr.Row():
+
                 predict_button = gr.Button(
                     "🔍 Analyze Leaf",
                     variant="primary"
@@ -313,6 +410,7 @@ with gr.Blocks(
                 )
 
         with gr.Column(scale=1):
+
             prediction_output = gr.Label(
                 num_top_classes=5,
                 label="🏆 Top 5 Predictions"
@@ -326,45 +424,64 @@ with gr.Blocks(
                 label="📄 Download Analysis Report"
             )
 
-    # Optional example images
+    # ==================================
+    # EXAMPLE LEAF IMAGES
+    # ==================================
+
     gr.Markdown("---")
     gr.Markdown("## 🖼️ Example Leaf Images")
+
     gr.Markdown(
         "Optional: add JPG, JPEG, PNG, or WEBP leaf images "
         "to the repository's `examples` folder to display them here."
     )
 
     if os.path.isdir(EXAMPLES_DIR):
+
         example_files = [
             os.path.join(EXAMPLES_DIR, filename)
-            for filename in sorted(os.listdir(EXAMPLES_DIR))
+            for filename in sorted(
+                os.listdir(EXAMPLES_DIR)
+            )
             if filename.lower().endswith(
                 (".jpg", ".jpeg", ".png", ".webp")
             )
         ][:6]
 
         if example_files:
+
             gr.Examples(
                 examples=example_files,
                 inputs=image_input,
                 label="Click an example to load it"
             )
+
         else:
+
             gr.Markdown(
                 "The examples folder is empty. "
                 "Upload some leaf images to display examples."
             )
+
     else:
+
         gr.Markdown(
             "Example gallery will appear after you add images "
             "to the `examples` folder in GitHub."
         )
 
-    # Technical details
+    # ==================================
+    # TECHNICAL DETAILS
+    # ==================================
+
     gr.Markdown("---")
     gr.Markdown("## ⚙️ Technical Details")
 
-    with gr.Accordion("Model and dataset information", open=False):
+    with gr.Accordion(
+        "Model and dataset information",
+        open=False
+    ):
+
         gr.Markdown("""
         - **Dataset:** PlantVillage
         - **Original dataset size:** 54,303 images
@@ -394,7 +511,10 @@ with gr.Blocks(
     </center>
     """)
 
-    # Button actions
+    # ==================================
+    # BUTTON ACTIONS
+    # ==================================
+
     predict_button.click(
         fn=predict_disease,
         inputs=[image_input],
@@ -418,13 +538,18 @@ with gr.Blocks(
 
 
 # ==========================================
-# 6. START APPLICATION ON RENDER
+# 8. START APPLICATION ON RENDER
 # ==========================================
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
+
+    port = int(
+        os.environ.get("PORT", "10000")
+    )
 
     demo.launch(
+        theme=theme,
+        css=custom_css,
         server_name="0.0.0.0",
         server_port=port
     )
